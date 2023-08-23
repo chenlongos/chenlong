@@ -1,8 +1,8 @@
 # chenlong
-晨龙操作系统,ArceOS 发行版
+晨龙操作系统是一个基于ArceOS 的发行版。 
 
-# 内核主页
-https://github.com/arce-os
+# 内核github地址
+[https://github.com/arce-os](https://github.com/rcore-os/arceos)
 
 # 包管理
 基于deb安装包进行管理
