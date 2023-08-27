@@ -1,4 +1,4 @@
-# chenlong
+# ChenlongOS
 辰龙操作系统是一个基于清华大学ArceOS 的安全操作系统发行版。 
 
 # 内核github地址
