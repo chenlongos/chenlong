@@ -14,7 +14,7 @@ bash，python3
 opencv，ROS
 
 # 辰龙起源
-辰龙操作系统是由 asmcos，limingth，郎铁山共同发起的开源项目；得到了chyyuu老师的大力支持。
+辰龙操作系统是由 asmcos，limingth 共同发起的开源项目；得到了chyyuu老师的大力支持。
 本开源项目致力于打造安全操作系统的社区发行版本。
 
 # 名字的由来
