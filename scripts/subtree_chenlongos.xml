@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+    <remote name="origin" fetch="git@github.com:sophgo/" review="git@github.com:sophgo/"/>
+    <default revision="cv18xx-v4.1.x" remote="origin" sync-j="4"/>
+
+    <!-- 必需工具链 -->
+    <project name="host-tools" revision="master"/>
+
+    <!-- rootfs 构建 -->
+    <project name="ramdisk"/>
+    <project name="buildroot-2021.05"/>
+
+    <!-- fip.bin 构建 (u-boot → opensbi → fsbl) -->
+    <project name="build"/>
+    <project name="u-boot-2021.10"/>
+    <project name="opensbi"/>
+    <project name="fsbl"/>
+</manifest>
