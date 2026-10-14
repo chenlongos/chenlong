@@ -1,0 +1,25 @@
+--- a/libbb/lineedit.c
++++ b/libbb/lineedit.c
+@@ -2376,10 +2376,18 @@
+ 		 */
+ 		parse_and_put_prompt(prompt);
+ 		fflush_all();
+-		if (fgets(command, maxsize, stdin) == NULL)
+-			len = -1; /* EOF or error */
+-		else
+-			len = strlen(command);
++		for (;;) {
++			if (fgets(command, maxsize, stdin) != NULL) {
++				len = strlen(command);
++				break;
++			}
++			/* A caught signal is not EOF on the canonical input path. */
++			if (!ferror(stdin) || errno != EINTR) {
++				len = -1; /* EOF or error */
++				break;
++			}
++			clearerr(stdin);
++		}
+ 		DEINIT_S();
+ 		return len;
+ 	}
