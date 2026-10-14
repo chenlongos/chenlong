@@ -1,0 +1,19 @@
+diff --git a/shell/ash.c b/shell/ash.c
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -4707,9 +4707,12 @@ waitcmd(int argc UNUSED_PARAM, char **argv)
+ 			job = getjob(*argv, 0);
+ 		}
+ 		/* loop until process terminated or stopped */
+-		dowait(DOWAIT_BLOCK_OR_SIG, NULL);
+-		if (pending_sig)
+-			goto sigout;
++		while (job->state == JOBRUNNING) {
++			/* Recheck the requested job after each child notification. */
++			waitone(DOWAIT_BLOCK_OR_SIG, NULL);
++			if (pending_sig)
++				goto sigout;
++		}
+ 		job->waited = 1;
+ 		retval = getstatus(job);
+  repeat: ;
