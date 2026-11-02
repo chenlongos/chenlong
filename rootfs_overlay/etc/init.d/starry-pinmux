@@ -1,0 +1,8 @@
+#!/bin/ash
+# Route the UART1/UART2 pads to /dev/ttyS1 and /dev/ttyS2 at boot.
+# akars drives the motors and the arm through these two ports, so the
+# routing has to happen before that application is started.
+# pinmux_tool is one-shot (writes /dev/pinmux and exits), so running it
+# synchronously here does not delay the login shell.
+[ -x /usr/bin/pinmux_tool ] || exit 0
+exec /usr/bin/pinmux_tool

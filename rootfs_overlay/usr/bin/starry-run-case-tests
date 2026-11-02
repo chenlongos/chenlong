@@ -1,0 +1,9 @@
+#!/bin/ash
+# Manual/boot entry point: run the required initialization services now.
+# The chenlong-dev StarryOS init.sh executes this synchronously before the
+# login shell, so every service must return immediately (daemons detach
+# themselves).  Each service is idempotent, so re-running is harmless.
+# pinmux runs first: akars needs the UART pads routed.
+for svc in pinmux sync akars; do
+    /etc/init.d/starry-$svc
+done

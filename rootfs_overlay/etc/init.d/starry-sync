@@ -1,0 +1,8 @@
+#!/bin/ash
+# Flush the ext4 root periodically; this kernel has no periodic sync.
+# sync-daemon.sh keeps a pidfile, so a second call is a no-op.
+SYNC_INTERVAL="${SYNC_INTERVAL:-10}"
+SYNC_DAEMON=/usr/bin/sync-daemon.sh
+[ -f "$SYNC_DAEMON" ] || exit 0
+setsid nohup /bin/ash "$SYNC_DAEMON" "$SYNC_INTERVAL" >/dev/null 2>&1 </dev/null &
+exit 0

@@ -62,12 +62,33 @@ TPU_SDK_DIR="${TOP_DIR}/dependency/cvitek_tpu_sdk"
 
 # StarryOS 内核源码
 TGOSKITS_DIR="${TOP_DIR}/tgoskits-chenlong"
-TGOSKITS_BRANCH="chenlong"
+TGOSKITS_BRANCH="chenlong-dev"
 TGOSKITS_DOCKER_IMAGE="ghcr.io/rcore-os/tgoskits-container:latest"
 TGOSKITS_DOCKER_NAME="tgoskits"
 KERNEL_DEFCONFIG="aka-00-sg2002"
-KERNEL_UIMG_REL="target/riscv64gc-unknown-none-elf/release/starryos.uimg"
+# 注：cargo starry build 的产物落在 riscv64gc-unknown-linux-musl/ 下；
+# 旧版本工具链曾输出到 riscv64gc-unknown-none-elf/，build_kernel 里有回退逻辑。
+KERNEL_UIMG_REL="target/riscv64gc-unknown-linux-musl/release/starryos.uimg"
 KERNEL_DTB_REL="os/StarryOS/configs/board/aka-00-sg2002.dtb"
+
+# 板端应用源码（github.com/chenlongos）
+REPO_REMOTE_URL="https://github.com/chenlongos/"
+AKARS_DIR="${TOP_DIR}/akars-race"
+AKARS_BRANCH="race"
+AKA00_DIR="${TOP_DIR}/AKA-00-chenlongos"
+AKA00_BRANCH="chenlongos"
+
+# 板端应用编译产物
+APPS_BUILD_DIR="${CHENLONGOS_DIR}/apps"
+WIFI_SWITCH_SRC="${TGOSKITS_DIR}/apps/starry/picoclaw-cli/wifi_switch.c"
+WIFI_SWITCH_BIN="${APPS_BUILD_DIR}/wifi_switch"
+PINMUX_TOOL_BIN="${AKA00_DIR}/utils/pinmux-tool/pinmux_tool"
+AKA00_DIST="${AKA00_DIR}/cpp/dist/AKA-00"
+AKARS_BIN="${AKARS_DIR}/target/riscv64gc-unknown-linux-musl/release/akars"
+AKARS_MODEL_REL="yolov8n_tennis_v4.cvimodel"
+
+# rootfs 定制层（服务脚本 / 开机入口脚本等静态文件）
+ROOTFS_OVERLAY_DIR="${TOP_DIR}/rootfs_overlay"
 
 # ============================================================
 # 辅助函数
@@ -76,11 +97,18 @@ log() { printf "\033[1;36m[chenlongos]\033[0m %s\n" "$*"; }
 warn() { printf "\033[1;33m[chenlongos]\033[0m WARNING: %s\n" "$*"; }
 err()  { printf "\033[1;31m[chenlongos]\033[0m ERROR: %s\n" "$*"; }
 
-# 最小权限：默认普通用户，仅特权命令用 sudo
-if [ "$(id -u)" -ne 0 ]; then
+# 最小权限：默认普通用户，仅特权命令用 sudo。
+# 打包阶段优先走 mount/losetup；若当前环境无法免密提权（无人值守/CI/无 tty 输密码），
+# 自动降级为纯用户态打包（mke2fs -d / mcopy / dd 拼接），完全不需要 root。
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+    PACK_PRIV=1
+elif sudo -n true 2>/dev/null; then
     SUDO="sudo"
+    PACK_PRIV=1
 else
     SUDO=""
+    PACK_PRIV=0
 fi
 
 # ============================================================
@@ -124,12 +152,26 @@ check_env() {
             exit 1
         fi
     done
+
+    # 板端应用编译工具：缺失只影响对应应用，镜像仍可构建
+    for tool in cargo rustup cmake; do
+        if ! command -v "${tool}" &>/dev/null; then
+            warn "缺少工具: ${tool}（相关板端应用会被跳过）"
+        fi
+    done
 }
 
 # 打包阶段额外需要的特权工具（mount/losetup 等需要 sudo）
 check_priv_tools() {
     local missing=0
-    for tool in mkfs.ext4 mkfs.vfat fdisk losetup mount umount; do
+    local tools
+    if [ "${PACK_PRIV}" -eq 1 ]; then
+        tools="mkfs.ext4 mkfs.vfat fdisk losetup mount umount"
+    else
+        warn "当前环境无免密 sudo，改用免 root 打包（mke2fs -d / mcopy / dd）"
+        tools="mke2fs mkfs.vfat mcopy sfdisk fdisk dd"
+    fi
+    for tool in ${tools}; do
         if ! command -v "${tool}" &>/dev/null; then
             err "打包阶段缺少工具: ${tool}"
             missing=1
@@ -148,6 +190,17 @@ do_clean() {
     log "清理 chenlongos 输出目录..."
     rm -rf "${CHENLONGOS_DIR}"
     rm -rf "${TPU_SDK_DIR}"
+
+    # 板端应用编译产物（third_party 不删，避免重新下载 libjpeg/mbedtls）
+    rm -rf "${AKARS_DIR}/target"
+    if [ -d "${AKA00_DIR}/cpp" ]; then
+        log "清理 AKA-00 构建产物 ..."
+        rm -rf "${AKA00_DIR}/cpp/csrc/build-cross" \
+               "${AKA00_DIR}/cpp/capp/build-cross" \
+               "${AKA00_DIR}/cpp/capp/bin" \
+               "${AKA00_DIR}/cpp/dist" \
+               "${PINMUX_TOOL_BIN}"
+    fi
 
     # 在 Docker 容器内 cargo clean 清理内核编译产物（不删除源码和容器）
     if docker ps -a --format '{{.Names}}' | grep -q "^${TGOSKITS_DOCKER_NAME}$"; then
@@ -222,6 +275,63 @@ build_fip_bin() {
 }
 
 # ============================================================
+# 第三方仓库准备：克隆或切到指定分支（github.com/chenlongos）
+# ============================================================
+ensure_repo_branch() {
+    local dir="$1"
+    local branch="$2"
+    local cur
+
+    cur=$(git -C "${dir}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [ "${cur}" = "${branch}" ]; then
+        return 0
+    fi
+
+    warn "  ${dir##*/} 当前分支 '${cur}'，切换到 '${branch}'（会丢弃本地改动）"
+    git -C "${dir}" fetch origin "${branch}" \
+        || { err "git fetch ${branch} 失败: ${dir}"; return 1; }
+    git -C "${dir}" checkout -f -B "${branch}" "origin/${branch}" \
+        || { err "git checkout ${branch} 失败: ${dir}"; return 1; }
+}
+
+prepare_repo() {
+    local repo="$1"
+    local path="$2"
+    local branch="$3"
+    local dir="${TOP_DIR}/${path}"
+
+    # 已存在：只校验分支（避免“目录在但分支不对”静默编出旧产物）
+    if [ -d "${dir}/.git" ]; then
+        log "  ${path} 已存在，校验分支 (${branch})"
+        ensure_repo_branch "${dir}" "${branch}"
+        return $?
+    fi
+
+    if [ -e "${dir}" ]; then
+        warn "  ${path} 已存在但不是 git 仓库，删除后重新克隆"
+        rm -rf "${dir}"
+    fi
+
+    log "  通过 repo_clone.sh 克隆 ${repo} (分支=${branch})..."
+    local tmp_manifest rc=0
+    tmp_manifest=$(mktemp)
+    cat > "${tmp_manifest}" <<XMLEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+    <remote name="chenlongos" fetch="${REPO_REMOTE_URL}"/>
+    <default revision="${branch}" remote="chenlongos"/>
+    <project name="${repo}" path="${path}"/>
+</manifest>
+XMLEOF
+    (cd "${TOP_DIR}" && bash "${SCRIPT_DIR}/repo_clone.sh" --gitclone "${tmp_manifest}") || rc=$?
+    rm -f "${tmp_manifest}"
+    if [ ${rc} -ne 0 ]; then
+        err "repo_clone.sh 克隆 ${repo} 失败"
+        return 1
+    fi
+}
+
+# ============================================================
 # 编译 StarryOS 内核 (依赖: Docker + cargo + tgoskits 仓库)
 # ============================================================
 build_kernel() {
@@ -238,29 +348,8 @@ build_kernel() {
         return 0
     fi
 
-    # ---- Step 1: clone tgoskits-chenlong (使用 repo_clone.sh + 临时 manifest) ----
-    if [ ! -d "${TGOSKITS_DIR}" ]; then
-        log "  通过 repo_clone.sh 克隆 tgoskits 仓库 (分支=${TGOSKITS_BRANCH})..."
-        local tmp_manifest
-        tmp_manifest=$(mktemp)
-        cat > "${tmp_manifest}" <<XMLEOF
-<?xml version="1.0" encoding="UTF-8"?>
-<manifest>
-    <remote name="chenlongos" fetch="https://github.com/chenlongos/"/>
-    <default revision="${TGOSKITS_BRANCH}" remote="chenlongos"/>
-    <project name="tgoskits" path="tgoskits-chenlong"/>
-</manifest>
-XMLEOF
-        (cd "${TOP_DIR}" && bash "${SCRIPT_DIR}/repo_clone.sh" --gitclone "${tmp_manifest}")
-        local rc=$?
-        rm -f "${tmp_manifest}"
-        if [ ${rc} -ne 0 ]; then
-            err "repo_clone.sh 克隆 tgoskits 仓库失败"
-            return 1
-        fi
-    else
-        log "  tgoskits-chenlong 已存在，跳过 clone"
-    fi
+    # ---- Step 1: 准备 tgoskits 仓库（缺则克隆，已存在则校验/切换分支）----
+    prepare_repo tgoskits tgoskits-chenlong "${TGOSKITS_BRANCH}" || return 1
 
     # ---- Step 2: 确保 Docker 镜像就绪 ----
     if ! docker image inspect "${TGOSKITS_DOCKER_IMAGE}" &>/dev/null; then
@@ -339,6 +428,17 @@ XMLEOF
     fi
 
     # ---- Step 5: 拷贝产物到 FAT_DIR ----
+    # 不同版本的 cargo starry 把 uimg 放在不同 target 目录（linux-musl / none-elf），
+    # 回退到最新生成的那一个，避免拷到历史遗留的旧内核
+    if [ ! -f "${kernel_uimg}" ]; then
+        local alt_uimg
+        alt_uimg=$(ls -1t "${TGOSKITS_DIR}"/target/*/release/starryos.uimg 2>/dev/null | head -1 || true)
+        if [ -n "${alt_uimg}" ]; then
+            warn "未找到 ${KERNEL_UIMG_REL}，改用 ${alt_uimg#"${TGOSKITS_DIR}/"}"
+            kernel_uimg="${alt_uimg}"
+        fi
+    fi
+
     if [ ! -f "${kernel_uimg}" ]; then
         err "内核镜像不存在: ${kernel_uimg}"
         return 1
@@ -355,6 +455,155 @@ XMLEOF
     log "内核编译完成:"
     log "  starryos.uimg → ${fat_uimg}"
     log "  aka-00-sg2002.dtb → ${fat_dtb}"
+}
+
+# ============================================================
+# wifi_switch: 运行时 Wi-Fi 模式切换工具 (源: tgoskits apps/starry/picoclaw-cli)
+# ============================================================
+build_wifi_switch() {
+    log "编译 wifi_switch ..."
+
+    if [ "${FORCE}" != "1" ] && [ -x "${WIFI_SWITCH_BIN}" ]; then
+        log "  wifi_switch 已存在，跳过编译 (FORCE=1 可强制重编)"
+        return 0
+    fi
+
+    if [ ! -f "${WIFI_SWITCH_SRC}" ]; then
+        err "未找到 wifi_switch.c: ${WIFI_SWITCH_SRC}"
+        return 1
+    fi
+
+    mkdir -p "${APPS_BUILD_DIR}"
+    "${CROSS_COMPILE_PATH}/bin/${CROSS_COMPILE_PREFIX}gcc" -static -O2 \
+        -o "${WIFI_SWITCH_BIN}" "${WIFI_SWITCH_SRC}" \
+        || { err "wifi_switch 编译失败"; return 1; }
+
+    log "  wifi_switch -> ${WIFI_SWITCH_BIN}"
+}
+
+# ============================================================
+# pinmux_tool: UART1/UART2 引脚复用工具 (源: AKA-00 utils/pinmux-tool)
+# ============================================================
+build_pinmux_tool() {
+    log "编译 pinmux_tool ..."
+
+    if [ "${FORCE}" != "1" ] && [ -x "${PINMUX_TOOL_BIN}" ]; then
+        log "  pinmux_tool 已存在，跳过编译 (FORCE=1 可强制重编)"
+        return 0
+    fi
+
+    if [ ! -f "${AKA00_DIR}/utils/pinmux-tool/Makefile" ]; then
+        err "未找到 AKA-00/utils/pinmux-tool"
+        return 1
+    fi
+
+    # TOOLCHAIN_DIR 需要结尾斜杠（Makefile 内拼 <dir>bin/<prefix>）
+    make -C "${AKA00_DIR}/utils/pinmux-tool" TOOLCHAIN_DIR="${CROSS_COMPILE_PATH}/" \
+        || { err "pinmux_tool 编译失败"; return 1; }
+
+    [ -x "${PINMUX_TOOL_BIN}" ] || { err "pinmux_tool 产物缺失: ${PINMUX_TOOL_BIN}"; return 1; }
+    log "  pinmux_tool -> ${PINMUX_TOOL_BIN}"
+}
+
+# ============================================================
+# AKA-00 (aka-capp 部署目录, 源: AKA-00 cpp/)
+# ============================================================
+build_aka00() {
+    log "编译 AKA-00 (aka-capp) ..."
+
+    if [ "${FORCE}" != "1" ] && [ -x "${AKA00_DIST}/aka-capp" ]; then
+        log "  dist/AKA-00 已存在，跳过编译 (FORCE=1 可强制重编)"
+        return 0
+    fi
+
+    local cpp_dir="${AKA00_DIR}/cpp"
+    [ -f "${cpp_dir}/Makefile" ] || { err "未找到 ${cpp_dir}/Makefile"; return 1; }
+
+    local with_tpu=1
+    if [ ! -f "${TPU_SDK_DIR}/include/cviruntime.h" ]; then
+        warn "  未找到 TPU SDK 头文件，AKA-00 退化 WITH_TPU=0 编译（无 TPU 推理）"
+        with_tpu=0
+    fi
+
+    # package = libjpeg -> mbedtls -> csrc -> capp -> tools/demos -> dist/AKA-00
+    # 首次编译会联网取 jpegsrc.v9f.tar.gz (ijg.org) 与 mbedtls v3.6.7 (GitHub)
+    if ! make -C "${cpp_dir}" package \
+            AKA_TOOLCHAIN_DIR="${CROSS_COMPILE_PATH}/" \
+            TPU_SDK_DIR="${TPU_SDK_DIR}" WITH_TPU="${with_tpu}"; then
+        if [ "${with_tpu}" = "1" ]; then
+            warn "  AKA-00 (WITH_TPU=1) 编译失败，清理后按 WITH_TPU=0 重试"
+            rm -rf "${cpp_dir}/csrc/build-cross" "${cpp_dir}/capp/build-cross" \
+                   "${cpp_dir}/capp/bin" "${AKA00_DIST}"
+            make -C "${cpp_dir}" package \
+                AKA_TOOLCHAIN_DIR="${CROSS_COMPILE_PATH}/" \
+                TPU_SDK_DIR="${TPU_SDK_DIR}" WITH_TPU=0 \
+                || { err "AKA-00 编译失败"; return 1; }
+        else
+            err "AKA-00 编译失败"
+            return 1
+        fi
+    fi
+
+    [ -x "${AKA00_DIST}/aka-capp" ] || { err "AKA-00 产物缺失: ${AKA00_DIST}/aka-capp"; return 1; }
+    log "  AKA-00 -> ${AKA00_DIST} ($(du -sh "${AKA00_DIST}" | cut -f1))"
+}
+
+# ============================================================
+# akars (源: akars race 分支, Rust + TPU SDK)
+# ============================================================
+build_akars() {
+    log "编译 akars ..."
+
+    if [ "${FORCE}" != "1" ] && [ -x "${AKARS_BIN}" ]; then
+        log "  akars 已存在，跳过编译 (FORCE=1 可强制重编)"
+        return 0
+    fi
+
+    if [ ! -f "${TPU_SDK_DIR}/include/cviruntime.h" ]; then
+        err "akars 需要 TPU SDK (${TPU_SDK_DIR})，跳过"
+        return 1
+    fi
+    command -v cargo >/dev/null 2>&1 || { err "缺少 cargo，跳过 akars"; return 1; }
+
+    # 不能复用仓库自带的 host-tools：Xuantie V2.6.1 (gcc 10.2 + 旧 binutils)
+    # 无法链接 Rust 1.9x 的 rlib（ld 不认识 zifencei 等 ISA 字符串），
+    # 必须用 akars 自带的 Xuantie V3.4.0 (gcc 14)。
+    local akars_tc="${AKARS_TOOLCHAIN_DIR:-${AKARS_DIR}/toolchains/xuantie-v3.4.0}"
+    if [ ! -x "${akars_tc}/bin/riscv64-unknown-linux-musl-gcc" ]; then
+        log "  安装 akars 依赖的 Xuantie V3.4.0 工具链（scripts/setup.sh，约 210MB）..."
+        # 传入 TPU SDK 后 setup.sh 会跳过 tpu-sdk-sg200x 子模块
+        ( cd "${AKARS_DIR}" && AKARS_TPU_SDK_DIR="${TPU_SDK_DIR}" ./scripts/setup.sh ) \
+            || { err "akars 环境准备失败（需联网下载工具链）"; return 1; }
+    fi
+
+    ( cd "${AKARS_DIR}" && \
+      AKARS_TOOLCHAIN_DIR="${akars_tc}" \
+      AKARS_TPU_SDK_DIR="${TPU_SDK_DIR}" \
+      ./scripts/build.sh ) \
+        || { err "akars 编译失败"; return 1; }
+
+    [ -x "${AKARS_BIN}" ] || { err "akars 产物缺失: ${AKARS_BIN}"; return 1; }
+    log "  akars -> ${AKARS_BIN}"
+}
+
+# ============================================================
+# 板端应用总入口：每个应用失败只告警，不阻断镜像构建
+# ============================================================
+build_apps() {
+    log "编译板端应用 (AKA-00 / akars / wifi_switch / pinmux_tool) ..."
+    mkdir -p "${APPS_BUILD_DIR}"
+
+    prepare_repo tgoskits tgoskits-chenlong "${TGOSKITS_BRANCH}" \
+        || warn "tgoskits 仓库不可用，wifi_switch 将被跳过"
+    prepare_repo AKA-00 AKA-00-chenlongos "${AKA00_BRANCH}" \
+        || warn "AKA-00 仓库不可用，AKA-00 / pinmux_tool 将被跳过"
+    prepare_repo akars akars-race "${AKARS_BRANCH}" \
+        || warn "akars 仓库不可用，akars 将被跳过"
+
+    build_wifi_switch || warn "wifi_switch 未编译"
+    build_pinmux_tool || warn "pinmux_tool 未编译"
+    build_aka00       || warn "AKA-00 未编译"
+    build_akars       || warn "akars 未编译"
 }
 
 # ============================================================
@@ -675,6 +924,70 @@ build_lib() {
 }
 
 # ============================================================
+# 安装 overlay 与板端应用到 rootfs
+# ============================================================
+install_file() {
+    local src="$1"
+    local dst="$2"
+    local mode="${3:-755}"
+
+    if [ ! -f "${src}" ]; then
+        warn "未找到 ${src}，跳过 ${dst#${ROOTFS_DIR}}"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "${dst}")"
+    cp -a "${src}" "${dst}"
+    chmod "${mode}" "${dst}"
+    log "  + ${dst#${ROOTFS_DIR}} ($(du -h "${dst}" | cut -f1))"
+}
+
+install_rootfs_overlay() {
+    log "安装 overlay 与板端应用到 rootfs ..."
+
+    # 1) 静态文件: /etc/init.d/starry-*、/usr/bin/starry-run-case-tests、/usr/bin/sync-daemon.sh
+    if [ ! -d "${ROOTFS_OVERLAY_DIR}" ]; then
+        err "未找到 rootfs overlay: ${ROOTFS_OVERLAY_DIR}"
+        return 1
+    fi
+    cp -a "${ROOTFS_OVERLAY_DIR}/." "${ROOTFS_DIR}/"
+    for f in "${ROOTFS_DIR}/etc/init.d/starry-"* \
+             "${ROOTFS_DIR}/usr/bin/starry-run-case-tests" \
+             "${ROOTFS_DIR}/usr/bin/sync-daemon.sh"; do
+        [ -e "${f}" ] || continue
+        chmod 755 "${f}"
+    done
+    log "  + rootfs overlay (${ROOTFS_OVERLAY_DIR})"
+
+    # 2) /usr/bin 工具
+    install_file "${WIFI_SWITCH_BIN}" "${ROOTFS_DIR}/usr/bin/wifi_switch"
+    install_file "${PINMUX_TOOL_BIN}" "${ROOTFS_DIR}/usr/bin/pinmux_tool"
+
+    # 3) /root 应用（akars 读 /root/akars.toml，必须同目录就能找到）
+    install_file "${AKARS_BIN}" "${ROOTFS_DIR}/root/akars"
+    install_file "${AKARS_DIR}/akars.example.toml" "${ROOTFS_DIR}/root/akars.toml" 644
+    install_file "${AKARS_DIR}/${AKARS_MODEL_REL}" "${ROOTFS_DIR}/root/${AKARS_MODEL_REL}" 644
+
+    if [ -x "${AKA00_DIST}/aka-capp" ]; then
+        rm -rf "${ROOTFS_DIR}/root/AKA-00"
+        cp -a "${AKA00_DIST}" "${ROOTFS_DIR}/root/AKA-00"
+        log "  + /root/AKA-00 ($(du -sh "${ROOTFS_DIR}/root/AKA-00" | cut -f1))"
+    else
+        warn "未找到 AKA-00 产物，跳过 /root/AKA-00"
+    fi
+
+    # 4) 容量校验：ext4 装不下就是烧录后静默掉文件
+    local used_mb limit_mb
+    used_mb=$(du -sm "${ROOTFS_DIR}" | cut -f1)
+    limit_mb=$((EXT4_SIZE_MB * 9 / 10))
+    if [ "${used_mb}" -gt "${limit_mb}" ]; then
+        err "rootfs 内容 ${used_mb}M 超过 ext4 分区 ${EXT4_SIZE_MB}M 的 90%，请调大 EXT4_SIZE_MB"
+        return 1
+    fi
+    log "rootfs 内容 ${used_mb}M / ext4 分区 ${EXT4_SIZE_MB}M"
+}
+
+# ============================================================
 # 生成 ext4 分区镜像
 # ============================================================
 pack_ext4() {
@@ -684,7 +997,32 @@ pack_ext4() {
     local ext4_img="${RAW_DIR}/rootfs.ext4"
     rm -f "${ext4_img}"
 
+    # /tmp 必须带 sticky 位，否则板上非 root 进程无法写
+    if [ -d "${ROOTFS_DIR}/tmp" ]; then
+        chmod 1777 "${ROOTFS_DIR}/tmp"
+    fi
+    if [ -d "${ROOTFS_DIR}/var/tmp" ]; then
+        chmod 1777 "${ROOTFS_DIR}/var/tmp"
+    fi
+
     dd if=/dev/zero of="${ext4_img}" bs=1M count="${EXT4_SIZE_MB}"
+
+    # 免 root：mke2fs -d 直接从目录树填充镜像。
+    # 属主需要在镜像里为 root，但本机无提权能力，故用 fakeroot 虚拟一个
+    # chown -R 0:0（只影响 mke2fs 看到的属主，不动真实文件）。
+    if [ "${PACK_PRIV}" -eq 0 ]; then
+        if command -v fakeroot &>/dev/null; then
+            fakeroot -- bash -c "chown -R 0:0 '${ROOTFS_DIR}' && mke2fs -q -F -t ext4 -L rootfs -E root_owner=0:0 -d '${ROOTFS_DIR}' '${ext4_img}'" \
+                || { err "mke2fs -d ${ext4_img} 失败"; return 1; }
+        else
+            warn "未安装 fakeroot，镜像内文件属主将为当前用户 ($(id -u):$(id -g))"
+            mke2fs -q -F -t ext4 -L rootfs -E root_owner=0:0 -d "${ROOTFS_DIR}" "${ext4_img}" \
+                || { err "mke2fs -d ${ext4_img} 失败"; return 1; }
+        fi
+        log "ext4 镜像: ${ext4_img} ($(du -h "${ext4_img}" | cut -f1))"
+        return 0
+    fi
+
     mkfs.ext4 -F -L rootfs "${ext4_img}"
 
     local loop_dev
@@ -700,7 +1038,9 @@ pack_ext4() {
     ${SUDO} cp -a "${ROOTFS_DIR}"/* "${mount_point}/"
     ${SUDO} chmod 1777 "${mount_point}/tmp" 2>/dev/null || true
     ${SUDO} chmod 1777 "${mount_point}/var/tmp" 2>/dev/null || true
-    ${SUDO} chown -R "$(id -u):$(id -g)" "${mount_point}" 2>/dev/null || true
+    # 镜像内文件应属 root（与原脚本 chown 回普通用户的做法相反，
+    # 否则板上非 root 进程拿不到应有的属主）
+    ${SUDO} chown -R 0:0 "${mount_point}" 2>/dev/null || true
     sync
     ${SUDO} umount "${mount_point}"
     unset 'PACK_MOUNTED["${mount_point}"]'
@@ -722,6 +1062,23 @@ pack_fat() {
 
     dd if=/dev/zero of="${fat_img}" bs=1M count="${FAT_SIZE_MB}"
     mkfs.vfat -F 32 -n BOOT "${fat_img}"
+
+    # 免 root：mtools 直接写入镜像（-s 递归 / -m 保留时间戳 / -o 覆盖）
+    if [ "${PACK_PRIV}" -eq 0 ]; then
+        local ucount=0
+        for item in "${FAT_DIR}"/*; do
+            [ -e "${item}" ] || continue
+            mcopy -s -m -o -i "${fat_img}" "${item}" ::/ \
+                || { err "mcopy $(basename "${item}") -> ${fat_img} 失败"; return 1; }
+            log "  + $(basename "${item}")"
+            ucount=$((ucount + 1))
+        done
+        if [ ${ucount} -eq 0 ]; then
+            warn "FAT_DIR 为空，FAT 分区没有任何文件"
+        fi
+        log "FAT32 镜像: ${fat_img} (${ucount} 个文件)"
+        return 0
+    fi
 
     local loop_dev
     loop_dev=$(${SUDO} losetup -fP --show "${fat_img}") \
@@ -790,6 +1147,31 @@ t
 w
 EOF
 
+    # 免 root：把已生成的两个分区镜像按分区表偏移直接拼进整卡镜像
+    if [ "${PACK_PRIV}" -eq 0 ]; then
+        local fat_img="${RAW_DIR}/boot.fat"
+        local ext4_img="${RAW_DIR}/rootfs.ext4"
+        [ -f "${fat_img}" ] || { err "缺少 ${fat_img}，请先执行 pack_fat"; return 1; }
+        [ -f "${ext4_img}" ] || { err "缺少 ${ext4_img}，请先执行 pack_ext4"; return 1; }
+
+        local parts p1_start p2_start
+        parts=$(sfdisk -d "${sd_img}" | awk -F'[=,]' '/ start=/ {gsub(/ /, "", $2); printf "%s ", $2}') || true
+        p1_start=$(echo "${parts}" | awk '{print $1}')
+        p2_start=$(echo "${parts}" | awk '{print $2}')
+        if [ -z "${p1_start}" ] || [ -z "${p2_start}" ]; then
+            err "无法从分区表解析 p1/p2 起始扇区"
+            return 1
+        fi
+
+        dd if="${fat_img}" of="${sd_img}" bs=512 seek="${p1_start}" conv=notrunc status=none \
+            || { err "写入 FAT 分区失败"; return 1; }
+        dd if="${ext4_img}" of="${sd_img}" bs=512 seek="${p2_start}" conv=notrunc status=none \
+            || { err "写入 ext4 分区失败"; return 1; }
+        sync
+        log "SD 卡镜像: ${sd_img} ($(du -h "${sd_img}" | cut -f1))"
+        return 0
+    fi
+
     # 分配第一个空闲 loop → 附加 → 触发分区扫描 → 打印设备名
     local loop_dev
     loop_dev=$(${SUDO} losetup -fP --show "${sd_img}") \
@@ -854,11 +1236,17 @@ print_report() {
     echo "    ${CHENLONGOS_DIR}/chenlongos.img"
     echo ""
     echo "  rootfs 大小: $(du -sh "${ROOTFS_DIR}" | cut -f1)"
+    echo "  打包方式: $([ "${PACK_PRIV}" -eq 1 ] && echo "losetup+mount (root)" || echo "免 root (mke2fs -d / mcopy / dd)")"
     echo "  /bin: $(find "${ROOTFS_DIR}/bin" -maxdepth 1 | wc -l) 项"
     echo "  /sbin: $(find "${ROOTFS_DIR}/sbin" -maxdepth 1 | wc -l) 项"
     echo "  /usr/bin: $(find "${ROOTFS_DIR}/usr/bin" -maxdepth 1 | wc -l) 项"
     echo "  /usr/sbin: $(find "${ROOTFS_DIR}/usr/sbin" -maxdepth 1 | wc -l) 项"
     echo "  /lib: $(find "${ROOTFS_DIR}/lib" -maxdepth 1 -type f | wc -l) 个文件 + $(find "${ROOTFS_DIR}/lib" -maxdepth 1 -type l | wc -l) 个软链接"
+    echo "  /etc/init.d: $(ls "${ROOTFS_DIR}/etc/init.d" 2>/dev/null | tr '\n' ' ')"
+    echo "  /usr/bin 工具: wifi_switch=$([ -x "${ROOTFS_DIR}/usr/bin/wifi_switch" ] && echo yes || echo no)" \
+         "pinmux_tool=$([ -x "${ROOTFS_DIR}/usr/bin/pinmux_tool" ] && echo yes || echo no)" \
+         "starry-run-case-tests=$([ -x "${ROOTFS_DIR}/usr/bin/starry-run-case-tests" ] && echo yes || echo no)"
+    echo "  /root: $(ls "${ROOTFS_DIR}/root" 2>/dev/null | tr '\n' ' ')"
     echo ""
     echo "  FAT 目录 (自动生成):"
     echo "    fip.bin"
@@ -933,28 +1321,34 @@ main() {
     # Step 3: 编译 buildroot (获取 usr/sbin)
     build_buildroot || { err "buildroot 编译失败，中止"; exit 1; }
 
-    # Step 4: 下载 TPU SDK（失败不阻塞流程，build_lib 会自动跳过 TPU 库）
-    download_tpu_sdk || warn "TPU SDK 下载失败，将跳过 TPU 相关库"
+    # Step 4: 下载 TPU SDK（失败不阻塞流程，build_lib / build_apps 会自动降级）
+    download_tpu_sdk || warn "TPU SDK 下载失败，将跳过 TPU 相关库与应用"
 
-    # Step 5: 创建 rootfs 目录结构
+    # Step 5: 编译板端应用（AKA-00 / akars / wifi_switch / pinmux_tool）
+    build_apps
+
+    # Step 6: 创建 rootfs 目录结构
     create_rootfs_structure
 
-    # Step 6:  /bin
+    # Step 7:  /bin
     simplify_bin
 
-    # Step 7:  /sbin
+    # Step 8:  /sbin
     simplify_sbin
 
-    # Step 8:  /usr/bin
+    # Step 9:  /usr/bin
     simplify_usr_bin
 
-    # Step 9: 从 buildroot rootfs 提取 usr/sbin
+    # Step 10: 从 buildroot rootfs 提取 usr/sbin
     extract_usr_sbin
 
-    # Step 10: 构建 /lib
+    # Step 11: 构建 /lib
     build_lib
 
-    # Step 11: 生成镜像（脚本内部按需自动 sudo 提升最小权限）
+    # Step 12: 安装 overlay（服务脚本）与板端应用到 rootfs
+    install_rootfs_overlay || { err "rootfs 安装失败，中止"; exit 1; }
+
+    # Step 13: 生成镜像（脚本内部按需自动 sudo 提升最小权限）
     check_priv_tools
     pack_ext4
     pack_fat
